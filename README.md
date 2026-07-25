@@ -2,6 +2,8 @@
 
 An async multi-venue data ingestion and archival system for prediction market orderbooks. Supports Kalshi (Trade API v2) and Polymarket (Gamma + CLOB APIs).
 
+**Coming back to this after a break? Read [`PROJECT_STATUS.md`](PROJECT_STATUS.md) first** — it has the current run state, the decisions behind the current config, and what's still open. This file is the architecture/config reference; that one is the "what am I doing" recap.
+
 ## Architecture
 
 ```
@@ -53,9 +55,14 @@ All settings are read from environment variables or a `.env` file.
 | `KALSHI_RATE_LIMIT_RPS` | `2.0` | Kalshi requests/second cap (500ms safety delay) |
 | `POLYMARKET_RATE_LIMIT_RPS` | `5.0` | Polymarket requests/second cap |
 | `MAX_SPREAD_FOR_TWO_SIDED` | `0.10` | Max (ask − bid) in probability units for `has_two_sided_book=True` |
-| `MIN_VOLUME_FOR_TIER2` | `0.0` | Minimum volume_fp to qualify for Tier-2 orderbook fetch |
+| `MIN_VOLUME_FOR_TIER2` | `0.0` | Minimum volume_fp to qualify for Tier-2 orderbook fetch. No floor — `TIER2_MAX_MARKETS_PER_CYCLE` bounds the work instead, so thin/forming books aren't excluded |
+| `TIER2_MAX_MARKETS_PER_CYCLE` | `250` | Hard cap on orderbook fetches per Tier-2 cycle, ranked by `volume_24h` DESC. Bounds cycle wall-clock regardless of gate size (2 RPS × 250 ≈ 125s) |
+| `TIER1_WRITE_UNCHANGED` | `False` | When `False`, a Tier-1 row is skipped if `(bid, ask, status)` match the market's last snapshot. Set `True` to write every row unconditionally |
+| `KALSHI_SLOW_TIER_INTERVAL_SECONDS` | `21600` | Heartbeat cadence (6h) for markets with no quote on either side — they still get at least one snapshot per interval even when unchanged |
+| `KALSHI_EXCLUDED_CATEGORIES` | `Sports` | Comma-separated Kalshi event categories excluded from Tier-1 entirely (matched on `event.category`; esports is filed under `Sports` too). Empty string disables |
+| `KALSHI_RETENTION_MONTHS` | `0` | Drop `market_snapshots` partitions older than N months, by calendar age alone. `0` disables — nothing is ever dropped |
 | `KALSHI_MAX_PAGES` | `1000` | Hard page cap kill switch on cursor pagination loops |
-| `LOG_LEVEL` | `INFO` | Python logging level |
+| `LOG_LEVEL` | `INFO` | Python logging level (`sqlalchemy.engine` is pinned to `WARNING` regardless, so `DEBUG` here won't dump SQL statements) |
 
 ## Ingestion Strategy
 
@@ -64,8 +71,8 @@ All settings are read from environment variables or a `.env` file.
 Ingestion is event-anchored via `/events?with_nested_markets=true`.
 The flat `/markets` stream is intentionally **not** used because it is dominated by millions of combinatorial parlay legs (`KXMVESPORTSMULTIGAMEEXTENDED-*`) that have no `/events` entry and no tradeable liquidity. Instead, we use a tiered strategy:
 
-*   **Tier 1 (Shallow, 15 min):** Paginate `/events?with_nested_markets=true` to exhaustion to discover all genuine prediction markets and their top-of-book quotes (`yes_bid_dollars`, `yes_ask_dollars`, etc.). Snapshot rows are stored with `depth_fetched = false` and `liquidity_at_Nc = NULL`.
-*   **Tier 2 (Deep, 5 min):** Find active markets whose latest snapshot is two-sided and narrow (`spread <= 0.10` and `volume >= MIN_VOLUME_FOR_TIER2`). For these gated markets, we fetch the full `/orderbook` depth and compute `liquidity_at_5c` / `liquidity_at_10c` with `depth_fetched = true`.
+*   **Tier 1 (Shallow, 15 min default):** Paginate `/events?with_nested_markets=true` to exhaustion to discover all genuine prediction markets and their top-of-book quotes (`yes_bid_dollars`, `yes_ask_dollars`, etc.). Snapshot rows are stored with `depth_fetched = false`, `liquidity_at_Nc = NULL`, and `raw_market = NULL` (the raw payload lives once, deduplicated, on the `markets` row — repeating it per snapshot was the single largest storage cost; see `PROJECT_STATUS.md`). A row is only written if `(bid, ask, status)` changed since that market's last snapshot, except markets with no quote on either side, which get a `KALSHI_SLOW_TIER_INTERVAL_SECONDS` heartbeat instead of being silently skipped forever. Markets under `KALSHI_EXCLUDED_CATEGORIES` are filtered out before any of this runs.
+*   **Tier 2 (Deep, 5 min default):** Find active markets whose latest snapshot is two-sided and narrow (`spread <= 0.10`), ranked by `volume_24h` DESC, capped to `TIER2_MAX_MARKETS_PER_CYCLE` per cycle. For these markets, fetch the full `/orderbook` depth and compute `liquidity_at_5c` / `liquidity_at_10c` with `depth_fetched = true` — these rows do keep `raw_market` + `raw_orderbook`, since that's genuinely per-capture data with no equivalent elsewhere. A hard per-cycle timeout means a slow cycle is abandoned rather than blocking the next one.
 
 ### Polymarket
 
